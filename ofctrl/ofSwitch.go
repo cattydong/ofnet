@@ -39,12 +39,13 @@ type OFSwitch struct {
 	normalLookup   *Output
 	ready          bool
 	portMux        sync.Mutex
-	statusMux      sync.Mutex
+	statusMux      sync.RWMutex
 	outputPorts    map[uint32]*Output
 	groupDb        map[uint32]*Group
 	retry          chan bool // Channel to notify controller reconnect switch
 	mQueue         chan *openflow13.MultipartRequest
 	monitorEnabled bool
+	readyCh        chan struct{}
 }
 
 var switchDb cmap.ConcurrentMap
@@ -120,13 +121,47 @@ func (self *OFSwitch) Disconnect() {
 func (self *OFSwitch) changeStatus(status bool) {
 	self.statusMux.Lock()
 	defer self.statusMux.Unlock()
+
 	self.ready = status
+
+	// notify all wait ready goroutines
+	if self.ready && self.readyCh != nil {
+		close(self.readyCh)
+		self.readyCh = nil
+	}
 }
 
 func (self *OFSwitch) IsReady() bool {
-	self.statusMux.Lock()
-	defer self.statusMux.Unlock()
+	self.statusMux.RLock()
+	defer self.statusMux.RUnlock()
 	return self.ready
+}
+
+func (self *OFSwitch) waitReady() {
+	if self.IsReady() {
+		return
+	}
+
+	readyCh := make(chan struct{}, 1)
+	defer close(readyCh)
+
+	func() {
+		self.statusMux.Lock()
+		defer self.statusMux.Unlock()
+		if !self.ready {
+			if self.readyCh == nil {
+				self.readyCh = make(chan struct{})
+			}
+			go func() {
+				readyCh <- <-self.readyCh
+			}()
+		} else {
+			go func() {
+				readyCh <- struct{}{}
+			}()
+		}
+	}()
+	<-readyCh
 }
 
 // Handle switch connected event
@@ -330,23 +365,18 @@ func (self *OFSwitch) DumpFlowStats(cookieID, cookieMask uint64, flowMatch *Flow
 func (self *OFSwitch) CheckStatus(timeout time.Duration) bool {
 	// Send echo request
 	self.changeStatus(false)
-	ch := make(chan bool)
+	ch := make(chan struct{})
+	res := openflow13.NewEchoRequest()
+	self.Send(res)
+
 	go func() {
-		res := openflow13.NewEchoRequest()
-		self.Send(res)
-		for {
-			if self.IsReady() {
-				ch <- true
-				return
-			} else {
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
+		self.waitReady()
+		ch <- struct{}{}
 	}()
 	select {
-	case status := <-ch:
-		log.Info("Connection status is ", status)
-		return status
+	case <-ch:
+		log.Info("Connection status is ", self.IsReady())
+		return self.ready
 	case <-time.After(timeout * time.Second):
 		return false
 	}
