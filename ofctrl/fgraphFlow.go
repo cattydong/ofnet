@@ -61,6 +61,8 @@ type FlowMatch struct {
 	Metadata      *uint64              // OVS metadata
 	MetadataMask  *uint64              // Metadata mask
 	TunnelId      uint64               // Vxlan Tunnel id i.e. VNI
+	TunnelDst     *net.IP              // IPv4 tunnel destination addr
+	TunnelIpv6Dst *net.IP              // IPv6 tunnel destination addr
 	TcpFlags      *uint16              // TCP flags
 	TcpFlagsMask  *uint16              // Mask for TCP flags
 	ConjunctionID *uint32              // Add AddConjunction ID
@@ -351,6 +353,18 @@ func (self *Flow) xlateMatch() openflow13.Match {
 	if self.Match.TunnelId != 0 {
 		tunnelIdField := openflow13.NewTunnelIdField(self.Match.TunnelId)
 		ofMatch.AddField(*tunnelIdField)
+	}
+
+	// Handle IPv4 tunnel destination addr
+	if self.Match.TunnelDst != nil {
+		tunnelDstField := openflow13.NewTunnelIpv4DstField(*self.Match.TunnelDst, nil)
+		ofMatch.AddField(*tunnelDstField)
+	}
+
+	// Handle IPv6 tunnel destination addr
+	if self.Match.TunnelIpv6Dst != nil {
+		tunnelIpv6DstField := openflow13.NewTunnelIpv6DstField(*self.Match.TunnelIpv6Dst, nil)
+		ofMatch.AddField(*tunnelIpv6DstField)
 	}
 
 	// Handle conjunction id
