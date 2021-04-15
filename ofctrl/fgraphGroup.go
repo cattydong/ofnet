@@ -86,6 +86,15 @@ func (self *Group) Install() error {
 	return nil
 }
 
+func (self *Group) InsertBuckets() error {
+	command := openflow13.OFPGC_INSERT_BUCKET
+	groupMod := self.getGroupModMessage(command)
+	if err := self.Switch.Send(groupMod); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (self *Group) getGroupModMessage(command int) *openflow13.GroupMod {
 	groupMod := openflow13.NewGroupMod()
 	groupMod.GroupId = self.ID
