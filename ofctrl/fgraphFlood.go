@@ -21,7 +21,7 @@ import (
 
 	"github.com/contiv/libOpenflow/openflow13"
 
-	log "github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 )
 
 // Flood Fgraph element
@@ -111,7 +111,7 @@ func (self *Flood) install() error {
 	// Loop thru all output ports and add it to group bucket
 	for _, output := range self.FloodList {
 		// Get the output action from output entry
-		act := output.outPort.GetOutAction()
+		act := output.outPort.GetActionMessage()
 		if act != nil {
 			// Create a new bucket for each port
 			bkt := openflow13.NewBucket()
@@ -138,7 +138,9 @@ func (self *Flood) install() error {
 	log.Debugf("Installing Group entry: %+v", groupMod)
 
 	// Send it to the switch
-	self.Switch.Send(groupMod)
+	if err := self.Switch.Send(groupMod); err != nil {
+		return err
+	}
 
 	// Mark it as installed
 	self.isInstalled = true
@@ -157,7 +159,9 @@ func (self *Flood) Delete() error {
 		log.Debugf("Deleting Group entry: %+v", groupMod)
 
 		// Send it to the switch
-		self.Switch.Send(groupMod)
+		if err := self.Switch.Send(groupMod); err != nil {
+			return err
+		}
 	}
 
 	return nil

@@ -15,6 +15,7 @@ limitations under the License.
 package ofctrl
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -23,9 +24,8 @@ import (
 	"testing"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/contiv/libOpenflow/openflow13"
-	"github.com/contiv/ofnet/ovsdbDriver"
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -37,10 +37,14 @@ type OfActor struct {
 	inputTable     *Table
 	nextTable      *Table
 	connectedCount int
+
+	pktInCount     int
+	tlvTableStatus *TLVTableStatus
+	tlvMapCh       chan struct{}
 }
 
 func (o *OfActor) PacketRcvd(sw *OFSwitch, packet *PacketIn) {
-	log.Printf("App: Received packet: %+v", packet)
+	log.Printf("App: Received packet: %+v", packet.Data.Data)
 }
 
 func (o *OfActor) SwitchConnected(sw *OFSwitch) {
@@ -61,14 +65,22 @@ func (o *OfActor) SwitchDisconnected(sw *OFSwitch) {
 	o.isSwitchConnected = false
 }
 
+func (o *OfActor) TLVMapReplyRcvd(sw *OFSwitch, tlvTableStatus *TLVTableStatus) {
+	log.Printf("App: Receive TLVMapTable reply: %s", tlvTableStatus)
+	o.tlvTableStatus = tlvTableStatus
+	if o.tlvMapCh != nil {
+		close(o.tlvMapCh)
+	}
+}
+
 var ofActor OfActor
 var ctrler *Controller
-var ovsDriver *ovsdbDriver.OvsDriver
+var ovsDriver *OvsDriver
 
 // Controller/Application/ovsBr work on clientMode
-var ofActor2 OfActor
+var ofActor2 *OfActor
 var ctrler2 *Controller
-var ovsDriver2 *ovsdbDriver.OvsDriver
+var ovsDriver2 *OvsDriver
 
 // Run an ovs-ofctl command
 func runOfctlCmd(cmd, brName string) ([]byte, error) {
@@ -140,26 +152,26 @@ func ofctlDumpFlowMatch(brName string, tableId int, matchStr, actStr string) boo
 
 // Test if OVS switch connects successfully
 func TestMain(m *testing.M) {
-	// Create a controller
+	//Create a controller
 	ctrler = NewController(&ofActor)
-	ofActor2 = OfActor{}
-	ctrler2 = NewController(&ofActor2)
+	ofActor2 = new(OfActor)
+	ctrler2 = NewController(ofActor2)
 
 	// start listening
 	go ctrler.Listen(":6733")
 
 	// Connect to ovsdb and add the controller
-	ovsDriver = ovsdbDriver.NewOvsDriver("ovsbr11")
+	ovsDriver = NewOvsDriver("ovsbr11")
 	err := ovsDriver.AddController("127.0.0.1", 6733)
 	if err != nil {
 		log.Fatalf("Error adding controller to ovs")
 	}
 
 	// Create ovs bridge and connect clientMode Controller to it
-	ovsDriver2 = ovsdbDriver.NewOvsDriver("ovsbr12")
+	ovsDriver2 = NewOvsDriver("ovsbr12")
 	//wait for 2sec and see if ovs br created
 	time.Sleep(2 * time.Second)
-	go ctrler2.Connect(fmt.Sprintf(defaultOVSDBAddressFormat, "ovsbr12"))
+	go ctrler2.Connect("/var/run/openvswitch/ovsbr12.mgmt")
 
 	//wait for 10sec and see if switch connects
 	time.Sleep(8 * time.Second)
@@ -177,25 +189,25 @@ func TestMain(m *testing.M) {
 	// Create initial tables
 	ofActor.inputTable = ofActor.Switch.DefaultTable()
 	if ofActor.inputTable == nil {
-		log.Fatalf("Failed to get input table")
+		log.Fatalf("Failed to get input Table")
 		return
 	}
 
 	ofActor.nextTable, err = ofActor.Switch.NewTable(1)
 	if err != nil {
-		log.Fatalf("Error creating next table. Err: %v", err)
+		log.Fatalf("Error creating next Table. Err: %v", err)
 		return
 	}
 
 	ofActor2.inputTable = ofActor2.Switch.DefaultTable()
 	if ofActor2.inputTable == nil {
-		log.Fatalf("Failed to get input table")
+		log.Fatalf("Failed to get input Table")
 		return
 	}
 
 	ofActor2.nextTable, err = ofActor2.Switch.NewTable(1)
 	if err != nil {
-		log.Fatalf("Error creating next table. Err: %v", err)
+		log.Fatalf("Error creating next Table. Err: %v", err)
 		return
 	}
 	log.Infof("Openflow tables created successfully")
@@ -204,20 +216,21 @@ func TestMain(m *testing.M) {
 	exitCode := m.Run()
 
 	// delete the bridge
-	err = ovsDriver.DeleteBridge("ovsbr11")
-	if err != nil {
-		log.Fatalf("Error deleting the bridge. Err: %v", err)
-	}
+	for _, br := range []string{
+		"ovsbr11",
+		"ovsbr12",
+	} {
+		err = ovsDriver.DeleteBridge(br)
+		if err != nil {
+			log.Fatalf("Error deleting the bridge. Err: %v", err)
+		}
 
-	err = ovsDriver2.DeleteBridge("ovsbr12")
-	if err != nil {
-		log.Fatalf("Error deleting the bridge. Err: %v", err)
 	}
 
 	os.Exit(exitCode)
 }
 
-// test create/delete table
+// test create/delete Table
 func TestTableCreateDelete(t *testing.T) {
 	var tables [12]*Table
 
@@ -304,7 +317,7 @@ func TestCreateDeleteFlow(t *testing.T) {
 		Priority:     100,
 		Ethertype:    0x0800,
 		IpProto:      6,
-		TcpDstPort:   80,
+		DstPort:      80,
 		TcpFlags:     &tcpFlag,
 		TcpFlagsMask: &tcpFlag,
 	})
@@ -588,15 +601,15 @@ func TestMatchIpv6Fields(t *testing.T) {
 	ipv6Da, _, _ := net.ParseCIDR("2016:0617::/100")
 	ipv6Mask := net.IP(ipv6Net.Mask)
 	inPortFlow, err := ofActor.inputTable.NewFlow(FlowMatch{
-		Priority:   100,
-		InputPort:  1,
-		Ethertype:  0x86DD,
-		Ipv6Sa:     &ipv6Sa,
-		Ipv6SaMask: &ipv6Mask,
-		Ipv6Da:     &ipv6Da,
-		Ipv6DaMask: &ipv6Mask,
-		IpProto:    IP_PROTO_TCP,
-		IpDscp:     23,
+		Priority:  100,
+		InputPort: 1,
+		Ethertype: 0x86DD,
+		IpSa:      &ipv6Sa,
+		IpSaMask:  &ipv6Mask,
+		IpDa:      &ipv6Da,
+		IpDaMask:  &ipv6Mask,
+		IpProto:   IP_PROTO_TCP,
+		IpDscp:    23,
 	})
 	if err != nil {
 		t.Errorf("Error creating inport flow. Err: %v", err)
@@ -633,13 +646,15 @@ func TestMatchIpv6Fields(t *testing.T) {
 // TestMatchSetTcpFields verifies match & set for tcp fields
 func TestMatchSetTcpFields(t *testing.T) {
 	tcpFlag := uint16(0x12)
+	srcPortMask := uint16(0xfff8)
 	inPortFlow, err := ofActor.inputTable.NewFlow(FlowMatch{
 		Priority:     100,
 		InputPort:    1,
 		Ethertype:    0x0800,
 		IpProto:      IP_PROTO_TCP,
-		TcpSrcPort:   8000,
-		TcpDstPort:   9000,
+		SrcPort:      0x8000,
+		SrcPortMask:  &srcPortMask,
+		DstPort:      9000,
 		TcpFlags:     &tcpFlag,
 		TcpFlagsMask: &tcpFlag,
 	})
@@ -658,7 +673,7 @@ func TestMatchSetTcpFields(t *testing.T) {
 	}
 
 	// verify metadata action exists
-	if !ofctlDumpFlowMatch("ovsbr11", 0, "priority=100,tcp,in_port=1,tp_src=8000,tp_dst=9000,tcp_flags=+syn+ack",
+	if !ofctlDumpFlowMatch("ovsbr11", 0, "priority=100,tcp,in_port=1,tp_src=0x8000/0xfff8,tp_dst=9000,tcp_flags=+syn+ack",
 		"set_field:5000->tcp_dst,set_field:4000->tcp_src,goto_table:1") {
 		t.Errorf("in port flow not found in OVS.")
 	}
@@ -670,7 +685,7 @@ func TestMatchSetTcpFields(t *testing.T) {
 	}
 
 	// Make sure they are really gone
-	if ofctlDumpFlowMatch("ovsbr11", 0, "priority=100,tcp,in_port=1,tp_src=8000,tp_dst=9000,tcp_flags=+syn+ack",
+	if ofctlDumpFlowMatch("ovsbr11", 0, "priority=100,tcp,in_port=1,tp_src=0x8000/0xfff8,tp_dst=9000,tcp_flags=+syn+ack",
 		"set_field:5000->tcp_dst,set_field:4000->tcp_src,goto_table:1") {
 		t.Errorf("in port flow still found in OVS after deleting it.")
 	}
@@ -679,12 +694,12 @@ func TestMatchSetTcpFields(t *testing.T) {
 // TestMatchSetUdpFields verifies match & set for udp fields
 func TestMatchSetUdpFields(t *testing.T) {
 	inPortFlow, err := ofActor.inputTable.NewFlow(FlowMatch{
-		Priority:   100,
-		InputPort:  1,
-		Ethertype:  0x0800,
-		IpProto:    IP_PROTO_UDP,
-		UdpSrcPort: 8000,
-		UdpDstPort: 9000,
+		Priority:  100,
+		InputPort: 1,
+		Ethertype: 0x0800,
+		IpProto:   IP_PROTO_UDP,
+		SrcPort:   8000,
+		DstPort:   9000,
 	})
 	if err != nil {
 		t.Errorf("Error creating inport flow. Err: %v", err)
@@ -730,8 +745,8 @@ func TestOFSwitch_DumpFlowStats(t *testing.T) {
 		InputPort:    1,
 		Ethertype:    0x0800,
 		IpProto:      IP_PROTO_TCP,
-		TcpSrcPort:   8000,
-		TcpDstPort:   9000,
+		SrcPort:      8000,
+		DstPort:      9000,
 		TcpFlags:     &tcpFlag,
 		TcpFlagsMask: &tcpFlag,
 	})
@@ -744,12 +759,12 @@ func TestOFSwitch_DumpFlowStats(t *testing.T) {
 	err = flow1.Next(ofActor.nextTable)
 
 	flow2, err := ofActor2.inputTable.NewFlow(FlowMatch{
-		Priority:   100,
-		InputPort:  1,
-		Ethertype:  0x0800,
-		IpProto:    IP_PROTO_UDP,
-		UdpSrcPort: 8000,
-		UdpDstPort: 9000,
+		Priority:  100,
+		InputPort: 1,
+		Ethertype: 0x0800,
+		IpProto:   IP_PROTO_UDP,
+		SrcPort:   8000,
+		DstPort:   9000,
 	})
 	if err != nil {
 		t.Errorf("Error creating inport flow. Err: %v", err)
@@ -767,7 +782,8 @@ func TestOFSwitch_DumpFlowStats(t *testing.T) {
 
 	cookieID := roundID | categoryID
 	cookieMask := uint64(0xffffff)
-	stats := ofActor2.Switch.DumpFlowStats(cookieID, cookieMask, nil, nil)
+	stats, err := ofActor2.Switch.DumpFlowStats(cookieID, &cookieMask, nil, nil)
+	require.Nil(t, err)
 	if stats == nil {
 		t.Fatalf("Failed to dump flows")
 	}
@@ -782,11 +798,112 @@ func TestOFSwitch_DumpFlowStats(t *testing.T) {
 	}
 }
 
+func TestMultiRangeOneReg(t *testing.T) {
+	ofApp := ofActor2
+	brName := ovsDriver2.OvsBridgeName
+	log.Infof("Enable monitor flows on table %d in bridge %s", ofApp.inputTable.TableId, brName)
+	ofApp.Switch.EnableMonitor()
+
+	srcMac1, _ := net.ParseMAC("11:11:11:11:11:11")
+	srcIP1 := net.ParseIP("192.168.2.10")
+	reg01 := &NXRegister{
+		ID:    0,
+		Data:  uint32(0x1),
+		Range: openflow13.NewNXRange(2, 5),
+	}
+	reg02 := &NXRegister{
+		ID:    0,
+		Data:  uint32(0xa),
+		Range: openflow13.NewNXRange(6, 9),
+	}
+
+	flow1 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			MacSa:     &srcMac1,
+			IpSa:      &srcIP1,
+			NxRegs:    []*NXRegister{reg01, reg02},
+		},
+	}
+	flow1.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow1, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,reg0=0x284/0x3fc,dl_src=11:11:11:11:11:11,nw_src=192.168.2.10",
+		"goto_table:1")
+
+	reg11 := &NXRegister{
+		ID:    1,
+		Data:  uint32(0x1),
+		Range: openflow13.NewNXRange(0, 3),
+	}
+	reg12 := &NXRegister{
+		ID:    1,
+		Data:  uint32(0xa),
+		Range: openflow13.NewNXRange(4, 7),
+	}
+
+	flow2 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			MacSa:     &srcMac1,
+			IpSa:      &srcIP1,
+			NxRegs:    []*NXRegister{reg11, reg12},
+		},
+	}
+	flow2.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow2, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,reg1=0xa1/0xff,dl_src=11:11:11:11:11:11,nw_src=192.168.2.10",
+		"goto_table:1")
+
+	reg21 := &NXRegister{
+		ID:    2,
+		Data:  uint32(0x1),
+		Range: openflow13.NewNXRange(2, 5),
+	}
+	reg22 := &NXRegister{
+		ID:    2,
+		Data:  uint32(0xa),
+		Range: openflow13.NewNXRange(6, 9),
+	}
+	reg23 := &NXRegister{
+		ID:    2,
+		Data:  uint32(11),
+		Range: openflow13.NewNXRange(10, 13),
+	}
+
+	flow3 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			MacSa:     &srcMac1,
+			IpSa:      &srcIP1,
+			NxRegs:    []*NXRegister{reg21, reg23, reg22},
+		},
+	}
+	flow3.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow3, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,reg2=0x2e84/0x3ffc,dl_src=11:11:11:11:11:11,nw_src=192.168.2.10",
+		"goto_table:1")
+
+}
+
+func (o *OfActor) MaxRetry() int {
+	return 5
+}
+
+func (o *OfActor) RetryInterval() time.Duration {
+	return 1 * time.Second
+}
+
 func TestReconnectOFSwitch(t *testing.T) {
 	app := new(OfActor)
 	ctrl := NewController(app)
 	brName := "br4reconn"
-	ovsBr := prepareContollerAndSwitch(t, app, ctrl, brName)
+	ovsBr := prepareControllerAndSwitch(t, app, ctrl, brName)
 	defer func() {
 		// Wait for flow entries flush
 		time.Sleep(1 * time.Second)
@@ -795,26 +912,27 @@ func TestReconnectOFSwitch(t *testing.T) {
 		}
 		ctrl.Delete()
 	}()
-	assert.Equal(t, ofActor2.connectedCount, 1)
+	assert.Equal(t, app.connectedCount, 1)
 	go func() {
 		ovsBr.DeleteBridge(brName)
-		time.Sleep(2 * time.Second)
-		ovsBr = ovsdbDriver.NewOvsDriver(brName)
-	}()
-	ch := make(chan struct{})
-	go func() {
-		time.Sleep(5 * time.Second)
-		ch <- struct{}{}
+		select {
+		case <-time.After(10 * time.Second):
+			ovsBr = NewOvsDriver(brName)
+		}
 	}()
 
-	<-ch
+	ovsBr.DeleteBridge(brName)
+	select {
+	case <-time.After(15 * time.Second):
+		break
+	}
 	assert.Equal(t, 2, app.connectedCount)
 }
 
-func prepareContollerAndSwitch(t *testing.T, app *OfActor, ctrl *Controller, brName string) (ovsBr *ovsdbDriver.OvsDriver) {
+func prepareControllerAndSwitch(t *testing.T, app *OfActor, ctrl *Controller, brName string) (ovsBr *OvsDriver) {
 	// Create ovs bridge and connect clientMode Controller to it
-	ovsBr = ovsdbDriver.NewOvsDriver(brName)
-	go ctrl.Connect(fmt.Sprintf(defaultOVSDBAddressFormat, brName))
+	ovsBr = NewOvsDriver(brName)
+	go ctrl.Connect(fmt.Sprintf("/var/run/openvswitch/%s.mgmt", brName))
 
 	time.Sleep(2 * time.Second)
 	setOfTables(t, app, brName)
@@ -850,9 +968,9 @@ func TestBundles(t *testing.T) {
 	flow1 := createFlow(t, "22:11:11:11:11:11", "192.168.2.11")
 	flow2 := createFlow(t, "22:11:11:11:11:12", "192.168.2.12")
 	for _, f := range []*Flow{flow1, flow2} {
-		fm, err := f.GenerateFlowModMessage(openflow13.FC_ADD)
+		fm, err := f.GetBundleMessage(openflow13.FC_ADD)
 		require.Nil(t, err, "Failed to generate FlowMod from Flow")
-		err = tx.AddFlow(fm)
+		err = tx.AddMessage(fm)
 		require.Nil(t, err, fmt.Sprintf("Failed to add flowMod into transaction: %v", err))
 	}
 	count, err := tx.Complete()
@@ -878,9 +996,9 @@ func TestBundles(t *testing.T) {
 	err = tx2.Begin()
 	require.Nil(t, err, fmt.Sprintf("Failed to create transaction: %v", err))
 	flow3 := createFlow(t, "22:11:11:11:11:13", "192.168.2.13")
-	fm3, err := flow3.GenerateFlowModMessage(openflow13.FC_ADD)
+	fm3, err := flow3.GetBundleMessage(openflow13.FC_ADD)
 	require.Nil(t, err, "Failed to generate FlowMod from Flow")
-	err = tx2.AddFlow(fm3)
+	err = tx2.AddMessage(fm3)
 	require.Nil(t, err, fmt.Sprintf("Failed to add flowMod into transaction: %v", err))
 	count, err = tx2.Complete()
 	require.Nil(t, err, fmt.Sprintf("Failed to complete transaction: %v", err))
@@ -900,15 +1018,78 @@ func TestBundles(t *testing.T) {
 	err = tx3.Begin()
 	require.Nil(t, err, fmt.Sprintf("Failed to create transaction: %v", err))
 	flow4 := createFlow(t, "33:11:11:11:11:14", "192.168.3.14")
-	fm4, err := flow4.GenerateFlowModMessage(openflow13.FC_ADD)
+	fm4, err := flow4.GetBundleMessage(openflow13.FC_ADD)
 	require.Nil(t, err, "Failed to generate FlowMod from Flow")
 	message, _ := tx3.createBundleAddMessage(fm4)
-	message.Xid = uint32(100001)
+	message.Header.Xid = uint32(100001)
 	tx3.ofSwitch.Send(message)
 	count, err = tx3.Complete()
 	require.Nil(t, err, fmt.Sprintf("Failed to find addMesssage errors transaction: %v", err))
 	assert.True(t, tx3.closed)
 	assert.Equal(t, 0, count)
+}
+
+func TestBundle2(t *testing.T) {
+	brName := ovsDriver2.OvsBridgeName
+	// Test transaction complete workflow
+	tx := ofActor2.Switch.NewTransaction(Ordered)
+	err := tx.Begin()
+	require.Nil(t, err, fmt.Sprintf("Failed to create transaction: %v", err))
+	_, found := ofActor2.Switch.txChans[tx.ID]
+	assert.True(t, found, fmt.Sprintf("Failed to add transaction with ID %d from switch queues", tx.ID))
+
+	groupId := uint32(2)
+	group1 := newGroup(groupId, GroupSelect, ofActor2.Switch)
+
+	natAction := openflow13.NewNXActionCTNAT()
+	if err := natAction.SetSNAT(); err != nil {
+		t.Errorf("Failed to set SNAT action: %v", err)
+	} else if err := natAction.SetRandom(); err != nil {
+		t.Errorf("Failed to set random action: %v", err)
+	} else {
+		natAction.SetRangeIPv4Min(net.ParseIP("10.0.0.240"))
+	}
+	ctAction := openflow13.NewNXActionConnTrack()
+	ctAction.Commit()
+	ctAction.AddAction(natAction)
+	bkt := openflow13.NewBucket()
+	bkt.Weight = 50
+	bkt.AddAction(ctAction)
+	group1.AddBuckets(bkt)
+	groupMod := group1.GetBundleMessage(openflow13.OFPGC_ADD)
+
+	inPort8 := uint32(11)
+	flow1, err := ofActor2.inputTable.NewFlow(FlowMatch{
+		Priority:  100,
+		Ethertype: 0x0800,
+		InputPort: inPort8,
+	})
+	require.Nil(t, err)
+	flow1.NextElem = group1
+	flowmod, err := flow1.GetBundleMessage(openflow13.FC_ADD)
+	require.Nil(t, err)
+
+	for _, mod := range []OpenFlowModMessage{groupMod, flowmod} {
+		err = tx.AddMessage(mod)
+		require.Nil(t, err, fmt.Sprintf("Failed to add mod message into transaction: %v", err))
+	}
+
+	count, err := tx.Complete()
+	require.Nil(t, err, fmt.Sprintf("Failed to complete transaction: %v", err))
+	assert.Equal(t, 2, count)
+	assert.True(t, tx.closed)
+	err = tx.Commit()
+	require.Nil(t, err, fmt.Sprintf("Failed to Commit transaction: %v", err))
+	_, found = ofActor2.Switch.txChans[tx.ID]
+	assert.False(t, found)
+
+	verifyGroup(t, brName, group1, "select", "bucket=weight:50,actions=ct(commit,nat(src=10.0.0.240,random))", true)
+	matchStr := "priority=100,ip,in_port=11"
+	actionStr := "group:2"
+	if !ofctlDumpFlowMatch(brName, int(ofActor2.inputTable.TableId), matchStr, actionStr) {
+		t.Errorf("br: %s, target flow not found on OVS, match: %s, actions: %s", brName, matchStr, actionStr)
+	}
+
 }
 
 func createFlow(t *testing.T, mac, ip string) *Flow {
@@ -930,11 +1111,706 @@ func createFlow(t *testing.T, mac, ip string) *Flow {
 
 // Test Nicira extensions for match field and actions
 func TestNXExtension(t *testing.T) {
-	testNXExtensionsWithOFApplication(ofActor, ovsDriver, t)
+	testNXExtensionsWithOFApplication(&ofActor, ovsDriver, t)
 	testNXExtensionsWithOFApplication(ofActor2, ovsDriver2, t)
 }
 
-func testNXExtensionsWithOFApplication(ofApp OfActor, ovsBr *ovsdbDriver.OvsDriver, t *testing.T) {
+func TestLearn(t *testing.T) {
+	testNXExtensionLearn(ofActor2, ovsDriver2, t)
+}
+
+func TestNotes(t *testing.T) {
+	testNXExtensionNote(ofActor2, ovsDriver2, t)
+}
+
+func TestNewFlowActionAPIs(t *testing.T) {
+	ofApp := ofActor2
+	brName := ovsDriver2.OvsBridgeName
+	log.Infof("Enable monitor flows on table %d in bridge %s", ofApp.inputTable.TableId, brName)
+	ofApp.Switch.EnableMonitor()
+
+	srcMac1, _ := net.ParseMAC("11:11:11:11:11:11")
+	srcIP1 := net.ParseIP("192.168.2.10")
+	flow1 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			MacSa:     &srcMac1,
+			IpSa:      &srcIP1,
+		},
+	}
+	newSrcMac := uint64(0x111111222222)
+	rng1 := openflow13.NewNXRange(0, 47)
+	loadReg, err := NewNXLoadAction("OXM_OF_ETH_SRC", newSrcMac, rng1)
+	require.Nil(t, err)
+	flow1.ApplyActions([]OFAction{loadReg})
+	flow1.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow1, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,dl_src=11:11:11:11:11:11,nw_src=192.168.2.10",
+		"load:0x111111222222->NXM_OF_ETH_SRC[],goto_table:1")
+
+	// Test action: move src mac to dst mac
+	srcMac2, _ := net.ParseMAC("11:11:11:11:11:22")
+	flow2 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			MacSa:     &srcMac2,
+			IpSa:      &srcIP1,
+		},
+	}
+	rng2 := openflow13.NewNXRange(0, 47)
+	act, err := NewNXMoveAction("NXM_OF_ETH_SRC", "NXM_OF_ETH_DST", rng2, rng2)
+	require.Nil(t, err, fmt.Sprintf("Failed to move data from NXM_OF_ETH_SRC to NXM_OF_ETH_DST: %+v", err))
+	flow2.ApplyActions([]OFAction{act})
+	flow2.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow2, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,dl_src=11:11:11:11:11:22,nw_src=192.168.2.10",
+		"move:NXM_OF_ETH_SRC[]->NXM_OF_ETH_DST[],goto_table:1")
+
+	// Test action: output in_port
+	inPort1 := uint32(103)
+	flow3 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			InputPort: inPort1,
+		},
+	}
+	flow3.ApplyActions([]OFAction{NewOutputInPort()})
+	verifyNewFlowInstallAndDelete(t, flow3, brName, ofApp.inputTable.TableId,
+		"priority=100,in_port=103",
+		"IN_PORT")
+
+	//Test action: output to register
+	inPort2 := uint32(104)
+	flow4 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			InputPort: inPort2,
+		},
+	}
+	nxRegOutput, _ := NewNXOutput("NXM_NX_REG1", 5, 10)
+	flow4.ApplyActions([]OFAction{nxRegOutput})
+	verifyNewFlowInstallAndDelete(t, flow4, brName, ofApp.inputTable.TableId,
+		"priority=100,in_port=104",
+		"output:NXM_NX_REG1[5..10]")
+
+	// Test action: conjunction
+	inPort3 := uint32(105)
+	flow5 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			InputPort: inPort3,
+		},
+	}
+	conjunction1, err := NewNXConjunctionAction(uint32(100), uint8(2), uint8(5))
+	require.Nil(t, err)
+	conjunction2, err := NewNXConjunctionAction(uint32(101), uint8(2), uint8(3))
+	require.Nil(t, err)
+	flow5.ApplyActions([]OFAction{
+		conjunction1,
+		conjunction2,
+	})
+	// install it
+	err = flow5.Send(openflow13.FC_ADD)
+	require.Nil(t, err)
+	matchStr := "priority=100,in_port=105"
+	actionStr := "conjunction(100,2/5),conjunction(101,2/3)"
+	tableID := int(ofApp.inputTable.TableId)
+	// verify metadata action exists
+	if !ofctlDumpFlowMatch(brName, tableID, matchStr, actionStr) {
+		t.Errorf("conjunction flow match: %s, actions: %s not found in OVS", matchStr, actionStr)
+	}
+	flow5.MonitorRealizeStatus()
+	time.Sleep(1 * time.Second)
+	log.Info("Flow realize status is ", flow5.IsRealized())
+	flow5.ResetApplyActions([]OFAction{conjunction1})
+	err = flow5.Send(openflow13.FC_MODIFY)
+	actionStr = "conjunction(100,2/5)"
+	// verify metadata action exists
+	if !ofctlDumpFlowMatch(brName, tableID, matchStr, actionStr) {
+		t.Errorf("conjunction flow match: %s, actions: %s not found in OVS", matchStr, actionStr)
+	}
+	// delete the flow
+	err = flow5.Send(openflow13.FC_DELETE_STRICT)
+	require.Nil(t, err, fmt.Sprintf("Error deleting the flow. Err: %v", err))
+	// Make sure they are really gone
+	if ofctlDumpFlowMatch(brName, tableID, matchStr, actionStr) {
+		t.Errorf("br: %s, target flow still found in OVS after deleting it", brName)
+	}
+
+	// Test action: set tun dst addr
+	inPort4 := uint32(106)
+	flow6 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			InputPort: inPort4,
+		},
+	}
+	tunDstAddr := net.ParseIP("192.168.2.100")
+	flow6.ApplyActions([]OFAction{
+		&SetTunnelDstAction{tunDstAddr}})
+	flow6.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow6, brName, ofApp.inputTable.TableId,
+		"priority=100,in_port=106",
+		"set_field:192.168.2.100->tun_dst,goto_table:1")
+
+	// Test action: move eth_src->dst_dst, move arp_sha->arp_tha, move arp_spa->arp_tpa,
+	// set_field: arp_op=2, eth_src, arp_sha, arp_spa,
+	// output:IN_PORT
+	inPort5 := uint32(107)
+	flow7 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0806,
+			InputPort: inPort5,
+			ArpOper:   1,
+		},
+	}
+
+	rng4 := openflow13.NewNXRange(0, 31)
+	sMAC, _ := net.ParseMAC("11:11:11:11:11:22")
+	sIP := net.ParseIP("192.168.1.100")
+	move1, err := NewNXMoveAction("NXM_OF_ETH_SRC", "NXM_OF_ETH_DST", rng2, rng2)
+	require.Nil(t, err)
+	move2, err := NewNXMoveAction("NXM_NX_ARP_SHA", "NXM_NX_ARP_THA", rng2, rng2)
+	require.Nil(t, err)
+	move3, err := NewNXMoveAction("NXM_OF_ARP_SPA", "NXM_OF_ARP_TPA", rng4, rng4)
+	require.Nil(t, err)
+	flow7.ApplyActions([]OFAction{
+		move1, move2, move3,
+		&SetARPOpAction{2},
+		&SetSrcMACAction{sMAC},
+		&SetARPShaAction{sMAC},
+		&SetARPSpaAction{sIP},
+		NewOutputInPort(),
+	})
+	verifyNewFlowInstallAndDelete(t, flow7, brName, ofApp.inputTable.TableId,
+		"priority=100,arp,in_port=107,arp_op=1",
+		"move:NXM_OF_ETH_SRC[]->NXM_OF_ETH_DST[],move:NXM_NX_ARP_SHA[]->NXM_NX_ARP_THA[],move:NXM_OF_ARP_SPA[]->NXM_OF_ARP_TPA[],set_field:2->arp_op,set_field:11:11:11:11:11:22->eth_src,set_field:11:11:11:11:11:22->arp_sha,set_field:192.168.1.100->arp_spa,IN_PORT")
+
+	// Test action: ct(commit, table=1, zone=0xff01,exec(load:0xf009->NXM_NX_CT_MARK[]))
+	inPort6 := uint32(108)
+	flow8 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			InputPort: inPort6,
+		},
+	}
+	ctTable := uint8(1)
+	ctZone := uint16(0xff01)
+	dstField, _ := openflow13.FindFieldHeaderByName("NXM_NX_CT_MARK", false)
+	loadData := uint64(0xf009)
+
+	ctLoadAction := openflow13.NewNXActionRegLoad(rng4.ToOfsBits(), dstField, loadData)
+	conntrack := NewNXConnTrackAction(true, false, &ctTable, &ctZone, ctLoadAction)
+	table2 := uint8(2)
+	flow8.ApplyActions([]OFAction{
+		conntrack,
+		NewResubmit(nil, &ofApp.nextTable.TableId),
+		NewResubmit(nil, &table2),
+	})
+	verifyNewFlowInstallAndDelete(t, flow8, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,in_port=108",
+		"ct(commit,table=1,zone=65281,exec(load:0xf009->NXM_NX_CT_MARK[])),resubmit(,1),resubmit(,2)")
+
+	// Test action: ct(table=1,zone=0xff01,nat)
+	flow80 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			InputPort: inPort6,
+		},
+	}
+	natAction0 := openflow13.NewNXActionCTNAT()
+	conntrack2 := NewNXConnTrackAction(false, false, &ctTable, &ctZone, natAction0)
+	flow80.ApplyActions([]OFAction{conntrack2})
+	flow80.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow80, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,in_port=108",
+		"ct(table=1,zone=65281,nat),goto_table:1")
+	// Test action: dec_ttl
+	inPort7 := uint32(109)
+	flow9 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			InputPort: inPort7,
+		},
+	}
+	flow9.ApplyActions([]OFAction{&DecTTLAction{}})
+	verifyNewFlowInstallAndDelete(t, flow9, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,in_port=109",
+		"dec_ttl")
+
+	// Test action: ct(commit, exec(move:NXM_OF_ETH_SRC[]->NXM_NX_CT_LABEL, load:0xf009->NXM_NX_CT_MARK[]))
+	// Test match: ct_state=+new-trk
+	ctStates := openflow13.NewCTStates()
+	ctStates.SetNew()
+	ctStates.UnsetTrk()
+	flow10 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			CtStates:  ctStates,
+		},
+	}
+	ctMoveSrc, _ := openflow13.FindFieldHeaderByName("NXM_OF_ETH_SRC", false)
+	ctMoveDst, _ := openflow13.FindFieldHeaderByName("NXM_NX_CT_LABEL", false)
+	ctMoveAction := openflow13.NewNXActionRegMove(48, 0, 0, ctMoveSrc, ctMoveDst)
+	conntrack3 := NewNXConnTrackAction(true, false, nil, nil, ctMoveAction, ctLoadAction)
+	flow10.ApplyActions([]OFAction{conntrack3})
+	verifyNewFlowInstallAndDelete(t, flow10, brName, ofApp.inputTable.TableId,
+		"priority=100,ct_state=+new-trk,ip",
+		"ct(commit,exec(move:NXM_OF_ETH_SRC[]->NXM_NX_CT_LABEL[0..47],load:0xf009->NXM_NX_CT_MARK[]))")
+
+	//Test match: reg1=0x12/0xffff
+	reg1 := &NXRegister{
+		ID:    2,
+		Data:  uint32(0x12),
+		Range: openflow13.NewNXRange(0, 15),
+	}
+	var regs = []*NXRegister{reg1}
+	flow11 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			NxRegs:    regs,
+		},
+	}
+	conntrack4 := NewNXConnTrackAction(true, false, nil, nil)
+	flow11.ApplyActions([]OFAction{conntrack4, NewResubmit(nil, &ofApp.nextTable.TableId)})
+	verifyNewFlowInstallAndDelete(t, flow11, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,reg2=0x12/0xffff",
+		"ct(commit),resubmit(,1)")
+
+	// Test group
+	groupId := uint32(11)
+	group1 := newGroup(groupId, GroupSelect, ofApp.Switch)
+
+	natAction := openflow13.NewNXActionCTNAT()
+	if err := natAction.SetSNAT(); err != nil {
+		t.Errorf("Failed to set SNAT action: %v", err)
+	} else if err := natAction.SetRandom(); err != nil {
+		t.Errorf("Failed to set random action: %v", err)
+	} else {
+		natAction.SetRangeIPv4Min(net.ParseIP("10.0.0.240"))
+	}
+	ctAction := NewNXConnTrackAction(true, false, nil, nil, natAction)
+	bkt := openflow13.NewBucket()
+	bkt.Weight = 50
+	bkt.AddAction(ctAction.GetActionMessage())
+	group1.AddBuckets(bkt)
+	err = group1.Install()
+	if err != nil {
+		t.Errorf("Failed to install group entry: %v", err)
+	}
+
+	verifyGroup(t, brName, group1, "select", "bucket=weight:50,actions=ct(commit,nat(src=10.0.0.240,random))", true)
+
+	// Install flow and refer to group
+	inPort8 := uint32(110)
+	flow13 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			InputPort: inPort8,
+		},
+	}
+	flow13.ApplyActions([]OFAction{group1})
+	verifyFlowInstallAndDelete(t, flow13, group1, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,in_port=110",
+		"group:1")
+	group1.Delete()
+	verifyGroup(t, brName, group1, "select", "bucket=weight:50,actions=ct(commit,nat(src=10.0.0.240,random))", false)
+}
+
+func TestSetTunnelMetadata(t *testing.T) {
+	ofApp := ofActor2
+	brName := ovsDriver2.OvsBridgeName
+	log.Infof("Enable monitor flows on table %d in bridge %s", ofApp.inputTable.TableId, brName)
+	ofApp.Switch.EnableMonitor()
+
+	tlvMap := &openflow13.TLVTableMap{OptClass: 0xff01, OptType: 0, OptLength: 4, Index: 0}
+	err := ofApp.Switch.AddTunnelTLVMap(tlvMap.OptClass, tlvMap.OptType, tlvMap.OptLength, tlvMap.Index)
+	require.Nil(t, err)
+
+	// Test "AddTunnelTLVMap" is idempotent
+	err = ofApp.Switch.AddTunnelTLVMap(tlvMap.OptClass, tlvMap.OptType, tlvMap.OptLength, tlvMap.Index)
+	require.Nil(t, err)
+
+	inPort9 := uint32(111)
+	flow14 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			InputPort: inPort9,
+		},
+	}
+	rng14 := openflow13.NewNXRange(8, 15)
+	loadReg2, err := NewNXLoadAction("NXM_NX_TUN_METADATA0", uint64(0x12), rng14)
+	require.Nil(t, err)
+	flow14.ApplyActions([]OFAction{loadReg2})
+	verifyNewFlowInstallAndDelete(t, flow14, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,in_port=111",
+		"set_field:0x1200/0xff00->tun_metadata0")
+
+	inPort10 := uint32(112)
+	rng15 := openflow13.NewNXRange(8, 23)
+
+	flow15 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			InputPort: inPort10,
+			Ethertype: 0x0800,
+			TunMetadatas: []*NXTunMetadata{
+				{
+					ID:    0,
+					Data:  uint32(0x34),
+					Range: rng15,
+				}},
+		},
+	}
+	rng16 := openflow13.NewNXRange(28, 31)
+	moveAction, err := NewNXMoveAction("NXM_NX_TUN_METADATA0", "NXM_NX_REG0", rng16, rng16)
+	require.Nil(t, err)
+	tlvMapStatus := ofApp.Switch.GetTLVMapTableStatus()
+	ResetFieldLength(moveAction.SrcField, tlvMapStatus)
+	flow15.ApplyActions([]OFAction{moveAction})
+	flow15.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow15, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,tun_metadata0=0x3400/0xffff00,in_port=112",
+		"move:NXM_NX_TUN_METADATA0[28..31]->NXM_NX_REG0[28..31],goto_table:1")
+
+	err = ofApp.Switch.DeleteTunnelTLVMap([]*openflow13.TLVTableMap{tlvMap})
+	require.Nil(t, err)
+}
+
+func TestGetMaskBytes(t *testing.T) {
+	rngBytes := getMaskBytes(8, 16)
+	assert.Equal(t, 4, len(rngBytes))
+	maskString := fmt.Sprintf("0x%x", rngBytes)
+	assert.Equal(t, "0x00ffff00", maskString)
+}
+
+func TestModPort(t *testing.T) {
+	app := new(OfActor)
+	ctrl := NewController(app)
+	brName := "br4modPort"
+	ovsBr := prepareControllerAndSwitch(t, app, ctrl, brName)
+	defer func() {
+		if err := ovsBr.DeleteBridge(brName); err != nil {
+			t.Errorf("Failed to delete br %s: %v", brName, err)
+		}
+		ctrl.Delete()
+	}()
+
+	testPort := "test"
+	portNo := 100
+	cmd := fmt.Sprintf("ovs-vsctl --may-exist add-port %s %s -- set Interface %s type=internal ofport_request=%d", brName, testPort, testPort, portNo)
+	err := exec.Command("/bin/bash", "-c", cmd).Run()
+	require.Nil(t, err)
+	time.Sleep(1 * time.Second)
+
+	cmd2 := fmt.Sprintf("ovs-vsctl get Interface %s mac_in_use", testPort)
+	macBytes, err := exec.Command("/bin/bash", "-c", cmd2).Output()
+	require.Nil(t, err)
+	macStr := strings.TrimRight(string(macBytes), "\n")
+	macStr = strings.Trim(macStr, "\"")
+	mac, _ := net.ParseMAC(macStr)
+	err = app.Switch.DisableOFPortForwarding(portNo, mac)
+	require.Nil(t, err)
+}
+
+func TestCtMatch(t *testing.T) {
+	app := new(OfActor)
+	ctrl := NewController(app)
+	brName := "br4ctMatch"
+	ovsBr := prepareControllerAndSwitch(t, app, ctrl, brName)
+	defer func() {
+		if err := ovsBr.DeleteBridge(brName); err != nil {
+			t.Errorf("Failed to delete br %s: %v", brName, err)
+		}
+		ctrl.Delete()
+	}()
+
+	app.Switch.EnableMonitor()
+
+	ctStates := openflow13.NewCTStates()
+	ctStates.SetNew()
+	inPort1 := uint32(201)
+	ctIpSrc := net.ParseIP("1.1.1.1")
+	flow1 := &Flow{
+		Table: app.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x0800,
+			InputPort: inPort1,
+			CtStates:  ctStates,
+			CtIpSa:    &ctIpSrc,
+		},
+	}
+	flow1.Goto(app.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow1, brName, app.inputTable.TableId,
+		"priority=100,ct_state=+new,ct_nw_src=1.1.1.1,ip,in_port=201",
+		"goto_table:1")
+
+	inPort2 := uint32(202)
+	ctIpDst := net.ParseIP("2.2.2.2")
+	flow2 := &Flow{
+		Table: app.inputTable,
+		Match: FlowMatch{
+			Priority:    100,
+			Ethertype:   0x0800,
+			InputPort:   inPort2,
+			CtStates:    ctStates,
+			CtIpDa:      &ctIpDst,
+			CtIpProto:   IP_PROTO_TCP,
+			CtTpSrcPort: 1001,
+			CtTpDstPort: 2002,
+		},
+	}
+	flow2.Goto(app.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow2, brName, app.inputTable.TableId,
+		"priority=100,ct_state=+new,ct_nw_dst=2.2.2.2,ct_nw_proto=6,ct_tp_src=1001,ct_tp_dst=2002,ip,in_port=202",
+		"goto_table:1")
+
+	ctIpSrc2 := net.ParseIP("3.3.3.0")
+	ctIpSrc2Mask := net.ParseIP("255.255.255.0")
+	flow3 := &Flow{
+		Table: app.inputTable,
+		Match: FlowMatch{
+			Priority:    100,
+			Ethertype:   0x0800,
+			InputPort:   inPort2,
+			CtStates:    ctStates,
+			CtIpSa:      &ctIpSrc2,
+			CtIpSaMask:  &ctIpSrc2Mask,
+			CtIpProto:   IP_PROTO_TCP,
+			CtTpSrcPort: 1001,
+			CtTpDstPort: 2002,
+		},
+	}
+	flow3.Goto(app.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow3, brName, app.inputTable.TableId,
+		"priority=100,ct_state=+new,ct_nw_src=3.3.3.0/24,ct_nw_proto=6,ct_tp_src=1001,ct_tp_dst=2002,ip,in_port=202",
+		"goto_table:1")
+}
+
+func TestIPv6Flows(t *testing.T) {
+	app := new(OfActor)
+	ctrl := NewController(app)
+	brName := "br4IPv6"
+	ovsBr := prepareControllerAndSwitch(t, app, ctrl, brName)
+	defer func() {
+		if err := ovsBr.DeleteBridge(brName); err != nil {
+			t.Errorf("Failed to delete br %s: %v", brName, err)
+		}
+		ctrl.Delete()
+	}()
+
+	app.Switch.EnableMonitor()
+
+	inport1 := uint32(1)
+	flow1 := &Flow{
+		Table: app.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x86dd,
+			InputPort: inport1,
+		},
+	}
+	sIP, ipNet, _ := net.ParseCIDR("abcd:234::2/32")
+	dIP := net.ParseIP("abcd:1234::2")
+	sIPMask := net.IP(ipNet.Mask)
+	setDIP := &SetDstIPAction{
+		IP:     dIP,
+		IPMask: nil,
+	}
+	setSIP := &SetSrcIPAction{
+		IP:     sIP,
+		IPMask: nil,
+	}
+	flow1.ApplyActions([]OFAction{setDIP, setSIP})
+	flow1.Goto(app.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow1, brName, app.inputTable.TableId,
+		"priority=100,ipv6,in_port=1",
+		"set_field:abcd:1234::2->ipv6_dst,set_field:abcd:234::2->ipv6_src,goto_table:1")
+
+	flow2 := &Flow{
+		Table: app.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x86dd,
+			IpSa:      &ipNet.IP,
+			IpSaMask:  &sIPMask,
+			IpDa:      &dIP,
+		},
+	}
+	flow2.Drop()
+	verifyNewFlowInstallAndDelete(t, flow2, brName, app.inputTable.TableId,
+		"priority=100,ipv6,ipv6_src=abcd:234::/32,ipv6_dst=abcd:1234::2",
+		"drop")
+
+	inport3 := uint32(3)
+	flow3 := &Flow{
+		Table: app.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x86dd,
+			InputPort: inport3,
+		},
+	}
+	loadSIPAction := &NXLoadXXRegAction{
+		FieldNumber: 3,
+		Value:       dIP,
+		Mask:        nil,
+	}
+	flow3.ApplyActions([]OFAction{loadSIPAction})
+	flow3.Goto(app.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow3, brName, app.inputTable.TableId,
+		"priority=100,ipv6,in_port=3",
+		"set_field:0xabcd1234000000000000000000000002->xxreg3,goto_table:1")
+
+	inport4 := uint32(4)
+	flow4 := &Flow{
+		Table: app.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x86dd,
+			InputPort: inport4,
+			XxRegs: []*XXRegister{
+				{
+					ID:   3,
+					Data: dIP,
+				},
+			},
+		},
+	}
+	flow4.Drop()
+	verifyNewFlowInstallAndDelete(t, flow4, brName, app.inputTable.TableId,
+		"priority=100,ipv6,reg12=0xabcd1234,reg13=0,reg14=0,reg15=0x2,in_port=4",
+		"drop")
+
+	inport5 := uint32(5)
+	icmp6Code := uint8(0)
+	icmp6Type := uint8(135)
+	flow5 := &Flow{
+		Table: app.inputTable,
+		Match: FlowMatch{
+			Priority:  100,
+			Ethertype: 0x86dd,
+			InputPort: inport5,
+			IpProto:   58,
+			Icmp6Type: &icmp6Type,
+			Icmp6Code: &icmp6Code,
+		},
+	}
+	tgtIP := net.ParseIP("2001:1:1:1443::ab:1004")
+	setNDTargetAct := &SetNDTargetAction{
+		Target: tgtIP,
+	}
+	setICMP6TypeAct := &SetICMPv6TypeAction{Type: 136}
+	flow5.ApplyActions([]OFAction{setNDTargetAct, setICMP6TypeAct})
+	flow5.Goto(app.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow5, brName, app.inputTable.TableId,
+		"priority=100,icmp6,in_port=5,icmp_type=135,icmp_code=0",
+		"set_field:2001:1:1:1443::ab:1004->nd_target,set_field:136->icmpv6_type,goto_table:1")
+}
+
+func testNXExtensionNote(ofApp *OfActor, ovsBr *OvsDriver, t *testing.T) {
+	brName := ovsBr.OvsBridgeName
+	log.Infof("Enable monitor flows on Table %d in bridge %s", ofApp.inputTable.TableId, brName)
+	ofApp.Switch.EnableMonitor()
+	srcMac1, _ := net.ParseMAC("33:33:11:11:11:11")
+	srcIP1 := net.ParseIP("192.168.1.10")
+	notes := []byte("test:abcd efgs.")
+	flow1, err := ofApp.inputTable.NewFlow(FlowMatch{
+		Priority:  100,
+		Ethertype: 0x0800,
+		MacSa:     &srcMac1,
+		IpSa:      &srcIP1,
+	})
+	require.Nil(t, err)
+	err = flow1.Note(notes)
+	require.Nil(t, err)
+	err = flow1.Next(ofApp.nextTable)
+	require.Nil(t, err)
+}
+
+func testNXExtensionLearn(ofApp *OfActor, ovsBr *OvsDriver, t *testing.T) {
+	brName := ovsBr.OvsBridgeName
+	log.Infof("Enable monitor flows on Table %d in bridge %s", ofApp.inputTable.TableId, brName)
+	ofApp.Switch.EnableMonitor()
+	srcMac1, _ := net.ParseMAC("22:22:11:11:11:11")
+	srcIP1 := net.ParseIP("192.168.1.10")
+	flow1, err := ofApp.inputTable.NewFlow(FlowMatch{
+		Priority:  100,
+		Ethertype: 0x0800,
+		MacSa:     &srcMac1,
+		IpSa:      &srcIP1,
+	})
+
+	learn := &FlowLearn{
+		idleTimeout:    10,
+		hardTimeout:    20,
+		priority:       80,
+		cookie:         0x123456789abcdef0,
+		tableID:        2,
+		finIdleTimeout: 2,
+		finHardTimeout: 4,
+	}
+
+	srcValue1 := make([]byte, 2)
+	binary.BigEndian.PutUint16(srcValue1, 99)
+	srcValue4 := make([]byte, 8)
+	binary.BigEndian.PutUint64(srcValue4, 0xaaaaaabbbbbb)
+
+	matchField1 := &LearnField{Start: 0, Name: "NXM_OF_IN_PORT"}
+	err = learn.AddMatch(matchField1, 16, nil, srcValue1)
+	require.Nil(t, err)
+	matchField2 := &LearnField{Start: 0, Name: "NXM_OF_ETH_DST"}
+	fromField2 := &LearnField{Start: 0, Name: "NXM_OF_ETH_SRC"}
+	err = learn.AddMatch(matchField2, 48, fromField2, nil)
+	require.Nil(t, err)
+	loadField3 := &LearnField{Start: 0, Name: "NXM_NX_REG1"}
+	fromField3 := &LearnField{Start: 0, Name: "NXM_OF_IN_PORT"}
+	err = learn.AddLoadAction(loadField3, 16, fromField3, nil)
+	require.Nil(t, err)
+	loadField4 := &LearnField{Start: 0, Name: "NXM_OF_ETH_SRC"}
+	err = learn.AddLoadAction(loadField4, 48, nil, srcValue4)
+	require.Nil(t, err)
+	outputField5 := &LearnField{Start: 0, Name: "NXM_OF_IN_PORT"}
+	err = learn.AddOutputAction(outputField5, 16)
+	require.Nil(t, err)
+	err = flow1.Learn(learn)
+	require.Nil(t, err)
+
+	err = flow1.Next(ofApp.nextTable)
+	require.Nil(t, err)
+	verifyFlowInstallAndDelete(t, flow1, ofApp.nextTable, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,dl_src=22:22:11:11:11:11,nw_src=192.168.1.10",
+		"learn(table=2,idle_timeout=10,hard_timeout=20,fin_idle_timeout=2,fin_hard_timeout=4,priority=80,cookie=0x123456789abcdef0,in_port=99,NXM_OF_ETH_DST[]=NXM_OF_ETH_SRC[],load:NXM_OF_IN_PORT[]->NXM_NX_REG1[0..15],load:0xaaaaaabb->NXM_OF_ETH_SRC[],output:NXM_OF_IN_PORT[]),goto_table:1")
+
+}
+
+func testNXExtensionsWithOFApplication(ofApp *OfActor, ovsBr *OvsDriver, t *testing.T) {
 	// Test action: load mac to src mac
 	brName := ovsBr.OvsBridgeName
 	log.Infof("Enable monitor flows on table %d in bridge %s", ofApp.inputTable.TableId, brName)
@@ -1003,8 +1879,8 @@ func testNXExtensionsWithOFApplication(ofApp OfActor, ovsBr *ovsdbDriver.OvsDriv
 	if err != nil {
 		t.Fatalf("Failed to generate flow: %+v", flow4)
 	}
-	nxRegOutput, _ := NewNXOutput("NXM_NX_REG1", 5, 10)
-	verifyFlowInstallAndDelete(t, flow4, nxRegOutput, brName, ofApp.inputTable.TableId,
+	flow4.OutputReg("NXM_NX_REG1", 5, 10)
+	verifyFlowInstallAndDelete(t, flow4, NewEmptyElem(), brName, ofApp.inputTable.TableId,
 		"priority=100,in_port=4",
 		"output:NXM_NX_REG1[5..10]")
 
@@ -1125,6 +2001,23 @@ func testNXExtensionsWithOFApplication(ofApp OfActor, ovsBr *ovsdbDriver.OvsDriv
 		"priority=100,ip,in_port=8",
 		"ct(commit,table=1,zone=65281,exec(load:0xf009->NXM_NX_CT_MARK[])),goto_table:1")
 
+	// Test action: ct(table=1,zone=0xff01,nat)
+	flow80, err := ofApp.inputTable.NewFlow(FlowMatch{
+		Priority:  100,
+		Ethertype: 0x0800,
+		InputPort: inPort6,
+	})
+	if err != nil {
+		t.Fatalf("Failed to generate flow: %+v", flow80)
+	}
+	natAction0 := openflow13.NewNXActionCTNAT()
+	err = flow80.ConnTrack(false, false, &ctTable, &ctZone, natAction0)
+	if err != nil {
+		t.Errorf("Failed to apply ct action: %+v", err)
+	}
+	verifyFlowInstallAndDelete(t, flow80, ofApp.nextTable, brName, ofApp.inputTable.TableId,
+		"priority=100,ip,in_port=8",
+		"ct(table=1,zone=65281,nat),goto_table:1")
 	// Test action: dec_ttl
 	inPort7 := uint32(9)
 	flow9, err := ofApp.inputTable.NewFlow(FlowMatch{
@@ -1245,11 +2138,37 @@ func testNXExtensionsWithOFApplication(ofApp OfActor, ovsBr *ovsdbDriver.OvsDriv
 	verifyGroup(t, brName, group1, "select", "bucket=weight:50,actions=ct(commit,nat(src=10.0.0.240,random))", false)
 }
 
+func verifyNewFlowInstallAndDelete(t *testing.T, flow *Flow, br string, tableID uint8, matchStr string, actionStr string) {
+	err := flow.Send(openflow13.FC_ADD)
+	if err != nil {
+		t.Errorf("Error installing flow. Err: %v", err)
+	}
+	flow.MonitorRealizeStatus()
+	// verify metadata action exists
+	if !ofctlDumpFlowMatch(br, int(tableID), matchStr, actionStr) {
+		t.Errorf("br: %s, target flow not found on OVS, match: %s, actions: %s", br, matchStr, actionStr)
+	}
+	if !flow.IsRealized() {
+		t.Errorf("Failed to realize flow status, match: %s, actions: %s", matchStr, actionStr)
+	}
+
+	// delete the flow
+	err = flow.Send(openflow13.FC_DELETE_STRICT)
+	if err != nil {
+		t.Errorf("Error deleting the flow. Err: %v", err)
+	}
+
+	// Make sure they are really gone
+	if ofctlDumpFlowMatch(br, int(tableID), matchStr, actionStr) {
+		t.Errorf("br: %s, target flow still found on OVS after deleting it: match: %s, actions: %s", br, matchStr, actionStr)
+	}
+}
+
 func verifyFlowInstallAndDelete(t *testing.T, flow *Flow, nextElem FgraphElem, br string, tableID uint8, matchStr string, actionStr string) {
 	// install it
 	err := flow.Next(nextElem)
 	if err != nil {
-		t.Errorf("Error installing inport flow. Err: %v", err)
+		t.Errorf("Error inport flow. Err: %v", err)
 	}
 	flow.MonitorRealizeStatus()
 	// verify metadata action exists
@@ -1307,4 +2226,116 @@ func ofctlGroupDump(brName string) ([]string, error) {
 	log.Debugf("groupList: %+v", groupDb)
 
 	return groupDb, nil
+}
+
+// Test flows using write_actions
+func TestWriteactionsFlows(t *testing.T) {
+	ofApp := ofActor2
+	brName := ovsDriver2.OvsBridgeName
+	log.Infof("Enable monitor flows on table %d in bridge %s", ofApp.inputTable.TableId, brName)
+	ofApp.Switch.EnableMonitor()
+
+	// Test dnatTable flow using write_actions
+	ipDa1 := net.ParseIP("10.96.0.0")
+	ipAddrMask1 := net.ParseIP("255.240.0.0")
+	flow1 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  200,
+			Ethertype: 0x0800,
+			IpDa:      &ipDa1,
+			IpDaMask:  &ipAddrMask1,
+		},
+	}
+
+	rng1 := openflow13.NewNXRange(16, 16)
+	loadReg1, err := NewNXLoadAction("NXM_NX_REG0", uint64(1), rng1)
+	require.Nil(t, err)
+	flow1.ApplyActions([]OFAction{loadReg1})
+	outputAction1 := NewOutputPort(uint32(1))
+	flow1.WriteActions([]OFAction{outputAction1})
+	flow1.Goto(ofApp.nextTable.TableId)
+	verifyNewFlowInstallAndDelete(t, flow1, brName, ofApp.inputTable.TableId,
+		"priority=200,ip,nw_dst=10.96.0.0/12",
+		"load:0x1->NXM_NX_REG0[16],write_actions(output:1),goto_table:1")
+
+	// Test l3ForwardingTable flow using write_actions
+	ipDa2 := net.ParseIP("172.30.0.0")
+	ipAddrMask2 := net.ParseIP("255.255.255.0")
+	flow2 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:  200,
+			Ethertype: 0x0800,
+			IpDa:      &ipDa2,
+			IpDaMask:  &ipAddrMask2,
+		},
+	}
+	decTTLAction2 := &DecTTLAction{}
+
+	srcMac2, _ := net.ParseMAC("11:11:11:11:11:11")
+	srcMacAction2 := &SetSrcMACAction{MAC: srcMac2}
+
+	dstMac2, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
+	dstMacAction2 := &SetDstMACAction{MAC: dstMac2}
+
+	rng2 := openflow13.NewNXRange(16, 16)
+	loadReg2, err := NewNXLoadAction("NXM_NX_REG0", uint64(1), rng2)
+
+	ipTunnelDa2 := net.ParseIP("192.168.20.1")
+	tunnelDstAction := &SetTunnelDstAction{IP: ipTunnelDa2}
+
+	flow2.ApplyActions([]OFAction{decTTLAction2, srcMacAction2, dstMacAction2, loadReg2, tunnelDstAction})
+
+	outputAction2 := NewOutputPort(uint32(1))
+	flow2.WriteActions([]OFAction{outputAction2})
+	flow2.Goto(ofApp.nextTable.TableId)
+	require.Nil(t, err)
+	verifyNewFlowInstallAndDelete(t, flow2, brName, ofApp.inputTable.TableId,
+		"priority=200,ip,nw_dst=172.30.0.0/24",
+		"dec_ttl,set_field:11:11:11:11:11:11->eth_src,set_field:aa:bb:cc:dd:ee:ff->eth_dst,load:0x1->NXM_NX_REG0[16],set_field:192.168.20.1->tun_dst,write_actions(output:1),goto_table:1")
+
+	// Test l2ForwardingCalcTable flow using write_actions
+	macDa3, _ := net.ParseMAC("11:11:11:11:11:11")
+
+	flow3 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority: 200,
+			MacDa:    &macDa3,
+		},
+	}
+
+	rng3 := openflow13.NewNXRange(16, 16)
+	loadReg3, err := NewNXLoadAction("NXM_NX_REG0", uint64(1), rng3)
+
+	flow3.ApplyActions([]OFAction{loadReg3})
+
+	outputAction3 := NewOutputPort(uint32(1))
+	flow3.WriteActions([]OFAction{outputAction3})
+	flow3.Goto(ofApp.nextTable.TableId)
+	require.Nil(t, err)
+	verifyNewFlowInstallAndDelete(t, flow3, brName, ofApp.inputTable.TableId,
+		"priority=200,dl_dst=11:11:11:11:11:11",
+		"load:0x1->NXM_NX_REG0[16],write_actions(output:1),goto_table:1")
+
+	// Test ingressrule table flow with actset_output
+	actsetOutput4 := uint32(105)
+	flow4 := &Flow{
+		Table: ofApp.inputTable,
+		Match: FlowMatch{
+			Priority:     200,
+			Ethertype:    0x0800,
+			ActsetOutput: actsetOutput4,
+		},
+	}
+
+	conjunction4, err := NewNXConjunctionAction(uint32(101), uint8(2), uint8(3))
+	require.Nil(t, err)
+	flow4.ApplyActions([]OFAction{conjunction4})
+
+	verifyNewFlowInstallAndDelete(t, flow4, brName, ofApp.inputTable.TableId,
+		"priority=200,actset_output=105,ip",
+		"conjunction(101,2/3)")
+
 }

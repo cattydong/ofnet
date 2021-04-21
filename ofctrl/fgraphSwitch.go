@@ -26,6 +26,7 @@ import (
 func (self *OFSwitch) initFgraph() error {
 	// Create the DBs
 	self.tableDb = make(map[uint8]*Table)
+	self.groupDb = make(map[uint32]*Group)
 	self.outputPorts = make(map[uint32]*Output)
 
 	// Create the table 0
@@ -58,9 +59,7 @@ func (self *OFSwitch) initFgraph() error {
 	groupMod.GroupId = openflow13.OFPG_ALL
 	groupMod.Command = openflow13.OFPGC_DELETE
 	groupMod.Type = openflow13.OFPGT_ALL
-	self.Send(groupMod)
-
-	return nil
+	return self.Send(groupMod)
 }
 
 // Create a new table. return an error if it already exists
