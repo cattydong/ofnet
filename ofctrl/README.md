@@ -23,6 +23,9 @@ This creates a new controller and registers the app for event callbacks. The app
 
         // Controller received a packet from the switch
         PacketRcvd(sw *OFSwitch, pkt *PacketIn)
+
+        // Controller received a multi-part reply from the switch
+        MultipartReply(sw *OFSwitch, rep *openflow13.MultipartReply)
     }
 
 # Example app
@@ -42,8 +45,11 @@ This creates a new controller and registers the app for event callbacks. The app
         o.Switch = sw
     }
 
+    func (o *OfActor) MultipartReply(sw *OFSwitch, rep *openflow13.MultipartReply) {
+    }
+
     func (o *OfApp) SwitchDisconnected(sw *ofctrl.OFSwitch) {
-        log.Printf("App: Switch connected: %v", sw.DPID())
+        log.Printf("App: Switch disconnected: %v", sw.DPID())
     }
 
     // Main app
@@ -154,40 +160,42 @@ Forwarding Graph elements are linked together as follows
  ----------------------------------------------------------------
  Example usage:
 ```
-     // Find the switch we want to operate on
-     switch := app.Switch
+    // Find the switch we want to operate on
+    switch := app.Switch
 
-     // Create all tables
-     rxVlanTbl := switch.NewTable(1)
-     macSaTable := switch.NewTable(2)
-     macDaTable := switch.NewTable(3)
-     ipTable := switch.NewTable(4)
-     inpTable := switch.DefaultTable() // table 0. i.e starting table
+    // Create all tables
+    rxVlanTbl, _ := switch.NewTable(1)
+    macSaTable, _ := switch.NewTable(2)
+    macDaTable, _ := switch.NewTable(3)
+    ipTable, _ := switch.NewTable(4)
+    inpTable := switch.DefaultTable() // table 0. i.e starting table
 
-     // Discard mcast source mac
-     dscrdMcastSrc := inpTable.NewFlow(FlowMatch{
-                                      &McastSrc: { 0x01, 0, 0, 0, 0, 0 }
-                                      &McastSrcMask: { 0x01, 0, 0, 0, 0, 0 }
-                                      }, 100)
-     dscrdMcastSrc.Next(switch.DropAction())
+    // Discard mcast source mac
+    mac, _ := net.ParseMAC("01:00:00:00:00:00")
+    dscrdMcastSrc, _ := inpTable.NewFlow(ofctrl.FlowMatch{
+                                                MacSa:     &mac,
+                                                MacSaMask: &mac,
+                                                })
+    dscrdMcastSrc.Next(switch.DropAction())
 
-     // All valid packets go to vlan table
-     validInputPkt := inpTable.NewFlow(FlowMatch{}, 1)
-     validInputPkt.Next(rxVlanTbl)
+    // All valid packets go to vlan table
+    validInputPkt, _ := inpTable.NewFlow(ofctrl.FlowMatch{})
+    validInputPkt.Next(rxVlanTbl)
 
-     // Set access vlan for port 1 and go to mac lookup
-     tagPort := rxVlanTbl.NewFlow(FlowMatch{
-                                  InputPort: Port(1)
-                                  }, 100)
-     tagPort.SetVlan(10)
-     tagPort.Next(macSaTable)
+    // Set access vlan for port 1 and go to mac lookup
+	tagPort, _ := rxVlanTbl.NewFlow(ofctrl.FlowMatch{
+                                               InputPort: 1,
+                                               })
+    tagPort.SetVlan(10)
+    tagPort.Next(macSaTable)
 
-     // Match on IP dest addr and forward to a port
-     ipFlow := ipTable.NewFlow(FlowParams{
-                               Ethertype: 0x0800,
-                               IpDa: &net.IPv4("10.10.10.10")
-                              }, 100)
+    // Match on IP dest addr and forward to a port
+	ip := net.ParseIP("10.10.10.10")
+	ipFlow, _ := ipTable.NewFlow(ofctrl.FlowMatch{
+                                            Ethertype: 0x0800,
+                                            IpDa:      &ip,
+                                            })
 
-     outPort := switch.NewOutputPort(10)
-     ipFlow.Next(outPort)
+    outPort, _ := switch.OutputPort(10)
+    ipFlow.Next(outPort)
 ```
