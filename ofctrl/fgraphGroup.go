@@ -15,20 +15,20 @@ const (
 )
 
 type GroupBundleMessage struct {
-	message *openflow15.GroupMod
+	Message *openflow15.GroupMod
 }
 
 func (m *GroupBundleMessage) resetXid(xid uint32) util.Message {
-	m.message.Xid = xid
-	return m.message
+	m.Message.Xid = xid
+	return m.Message
 }
 
 func (m *GroupBundleMessage) getXid() uint32 {
-	return m.message.Xid
+	return m.Message.Xid
 }
 
 func (m *GroupBundleMessage) GetMessage() util.Message {
-	return m.message
+	return m.Message
 }
 
 type Group struct {

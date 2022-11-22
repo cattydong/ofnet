@@ -20,20 +20,20 @@ const (
 )
 
 type MeterBundleMessage struct {
-	message *openflow15.MeterMod
+	Message *openflow15.MeterMod
 }
 
 func (m *MeterBundleMessage) resetXid(xid uint32) util.Message {
-	m.message.Xid = xid
-	return m.message
+	m.Message.Xid = xid
+	return m.Message
 }
 
 func (m *MeterBundleMessage) getXid() uint32 {
-	return m.message.Xid
+	return m.Message.Xid
 }
 
 func (m *MeterBundleMessage) GetMessage() util.Message {
-	return m.message
+	return m.Message
 }
 
 type Meter struct {
