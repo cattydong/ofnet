@@ -292,6 +292,10 @@ func (self *OFSwitch) handleMessages(dpid net.HardwareAddr, msg util.Message) {
 			reply := t.VendorData.(*openflow15.TLVTableReply)
 			status := TLVTableStatus(*reply)
 			self.tlvMgr.TLVMapReplyRcvd(self, &status)
+		case openflow15.Type_PacketIn2:
+			pktInMsg := t.VendorData.(*openflow15.PacketIn2)
+			pktIn := parsePacktInFromNXPacketIn2(pktInMsg)
+			self.app.PacketRcvd(self, pktIn)
 		}
 
 	case *openflow15.BundleCtrl:
@@ -314,7 +318,8 @@ func (self *OFSwitch) handleMessages(dpid net.HardwareAddr, msg util.Message) {
 	case *openflow15.PacketIn:
 		log.Debugf("Received packet(ofctrl): %+v", t)
 		// send packet rcvd callback
-		self.app.PacketRcvd(self, (*PacketIn)(t))
+		pktIn := &PacketIn{PacketIn: t}
+		self.app.PacketRcvd(self, pktIn)
 
 	case *openflow15.FlowRemoved:
 
