@@ -153,8 +153,7 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, co
 	if controllerV2 {
 		pktFmt = openflow15.OFPUTIL_PACKET_IN_NXT2
 	}
-	fmtMsg := openflow15.NewSetPacketInFormat(pktFmt)
-	assert.NoError(t, ofSwitch.Send(fmtMsg))
+	assert.NoError(t, ofSwitch.SetPacketInFormat(pktFmt))
 
 	table0 := ofSwitch.DefaultTable()
 	var ethertype uint16
@@ -215,11 +214,11 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, co
 	// Delete flow after the packetIn message is received
 	assert.NoError(t, flow1.Delete())
 
-	// Validate packetIn.Reason
+	// Validate packetIn.Reason.
 	assert.Equal(t, reason, pktIn.Reason)
-	// Validate packetIn.UserData
+	// Validate packetIn.UserData.
 	assert.Equal(t, userData, pktIn.UserData)
-	// Validate packetIn.Match
+	// Validate packetIn.Match.
 	matchers := pktIn.GetMatches()
 	reg0Match := getMatchFieldByRegID(matchers, 0)
 	assert.NotNil(t, reg0Match)
