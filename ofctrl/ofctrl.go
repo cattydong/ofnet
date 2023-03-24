@@ -28,7 +28,6 @@ import (
 	"antrea.io/libOpenflow/common"
 	"antrea.io/libOpenflow/openflow15"
 	"antrea.io/libOpenflow/util"
-
 	log "github.com/sirupsen/logrus"
 )
 

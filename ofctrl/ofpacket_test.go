@@ -54,6 +54,7 @@ func TestPacketIn_PacketOut(t *testing.T) {
 		reason       uint8
 		userData     []byte
 		tcpDst       uint16
+		pause        bool
 	}{
 		{
 			name:         "ipv4-controller",
@@ -93,10 +94,25 @@ func TestPacketIn_PacketOut(t *testing.T) {
 			reason:       1,
 			tcpDst:       1005,
 			userData:     []byte{4, 5, 6},
+		}, {
+			name:         "ipv4-controller2-pause-resume",
+			isIPv6:       false,
+			controllerv2: true,
+			reason:       1,
+			tcpDst:       1005,
+			userData:     []byte{1, 2, 3},
+			pause:        true,
+		}, {
+			name:         "ipv6-controller2-pause-resume",
+			isIPv6:       true,
+			controllerv2: true,
+			reason:       1,
+			tcpDst:       1005,
+			pause:        true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testPacketInOut(t, app, tc.isIPv6, tc.reason, tc.controllerv2, tc.tcpDst, tc.userData)
+			testPacketInOut(t, app, tc.isIPv6, tc.reason, tc.controllerv2, tc.tcpDst, tc.userData, tc.pause)
 		})
 	}
 }
@@ -135,7 +151,7 @@ func TestNxOutputAndSendController(t *testing.T) {
 		fmt.Sprintf("output:NXM_NX_REG0[],controller(max_len=128,id=%d)", app.Switch.ctrlID))
 }
 
-func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, controllerV2 bool, dstPort uint16, userData []byte) {
+func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, controllerV2 bool, dstPort uint16, userData []byte, pause bool) {
 	ofSwitch := ofApp.Switch
 	srcMAC, _ := net.ParseMAC("11:22:33:44:55:66")
 	dstMAC, _ := net.ParseMAC("66:55:44:33:22:11")
@@ -148,13 +164,12 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, co
 		srcIP = net.ParseIP("1.1.1.2")
 		dstIP = net.ParseIP("2.2.2.1")
 	}
-	// Set PacketIn format
+	// Set PacketIn format.
 	pktFmt := uint32(openflow15.OFPUTIL_PACKET_IN_STD)
 	if controllerV2 {
 		pktFmt = openflow15.OFPUTIL_PACKET_IN_NXT2
 	}
-	fmtMsg := openflow15.NewSetPacketInFormat(pktFmt)
-	assert.NoError(t, ofSwitch.Send(fmtMsg))
+	assert.NoError(t, ofSwitch.SetPacketInFormat(pktFmt))
 
 	table0 := ofSwitch.DefaultTable()
 	var ethertype uint16
@@ -189,7 +204,7 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, co
 		expectTunDst = net.ParseIP("10.10.10.10")
 	}
 	act5 := &SetTunnelDstAction{IP: expectTunDst}
-	cxControllerAct := &NXController{Version2: controllerV2, ControllerID: ofSwitch.ctrlID, Reason: reason, UserData: userData}
+	cxControllerAct := &NXController{Version2: controllerV2, ControllerID: ofSwitch.ctrlID, Reason: reason, UserData: userData, Pause: pause}
 	flow1.ApplyActions([]OFAction{act1, act2, act3, act5, cxControllerAct})
 	assert.NoError(t, flow1.Send(openflow15.FC_ADD))
 
@@ -212,14 +227,14 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, co
 		t.Fatalf("PacketIn timeout")
 	}
 
-	// Delete flow after the packetIn message is received
+	// Delete flow after the packetIn message is received.
 	assert.NoError(t, flow1.Delete())
 
-	// Validate packetIn.Reason
+	// Validate packetIn.Reason.
 	assert.Equal(t, reason, pktIn.Reason)
-	// Validate packetIn.UserData
+	// Validate packetIn.UserData.
 	assert.Equal(t, userData, pktIn.UserData)
-	// Validate packetIn.Match
+	// Validate packetIn.Match.
 	matchers := pktIn.GetMatches()
 	reg0Match := getMatchFieldByRegID(matchers, 0)
 	assert.NotNil(t, reg0Match)
@@ -263,6 +278,10 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, co
 		assert.Equal(t, dstPort, tcpObj.PortDst)
 	} else {
 		assert.Equal(t, dstIP.To4(), ethData.Data.(*protocol.IPv4).NWDst)
+	}
+	if pause {
+		pktIn.Continuation = []byte{7, 8, 9}
+		assert.NoError(t, ofSwitch.ResumePacket(pktIn))
 	}
 }
 
