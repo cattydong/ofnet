@@ -185,22 +185,20 @@ var (
 	UnknownActionTypeError  = errors.New("unknown action type")
 )
 
-type FlowBundleMessage struct {
-	message *openflow15.FlowMod
-}
+type FlowBundleMessage openflow15.FlowMod
 
 func (m *FlowBundleMessage) resetXid(xid uint32) util.Message {
-	m.message.Xid = xid
-	log.Debugf("resetXid xid: %x", m.message.Xid)
-	return m.message
+	m.Xid = xid
+	log.Debugf("resetXid xid: %x", m.Xid)
+	return m
 }
 
 func (m *FlowBundleMessage) getXid() uint32 {
-	return m.message.Xid
+	return m.Xid
 }
 
 func (m *FlowBundleMessage) GetMessage() util.Message {
-	return m.message
+	return m
 }
 
 // string key for the flow
@@ -2129,7 +2127,8 @@ func (self *Flow) GetBundleMessage(command int) (*FlowBundleMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FlowBundleMessage{flowMod}, nil
+	msg := FlowBundleMessage(*flowMod)
+	return &msg, nil
 }
 
 func (self *Flow) ApplyAction(action OFAction) {

@@ -14,21 +14,19 @@ const (
 	GroupFF
 )
 
-type GroupBundleMessage struct {
-	message *openflow15.GroupMod
-}
+type GroupBundleMessage openflow15.GroupMod
 
 func (m *GroupBundleMessage) resetXid(xid uint32) util.Message {
-	m.message.Xid = xid
-	return m.message
+	m.Xid = xid
+	return m
 }
 
 func (m *GroupBundleMessage) getXid() uint32 {
-	return m.message.Xid
+	return m.Xid
 }
 
 func (m *GroupBundleMessage) GetMessage() util.Message {
-	return m.message
+	return m
 }
 
 type Group struct {
@@ -123,7 +121,8 @@ func (self *Group) getGroupModMessage(command int) *openflow15.GroupMod {
 
 func (self *Group) GetBundleMessage(command int) *GroupBundleMessage {
 	groupMod := self.getGroupModMessage(command)
-	return &GroupBundleMessage{groupMod}
+	msg := GroupBundleMessage(*groupMod)
+	return &msg
 }
 
 func (self *Group) Delete() error {

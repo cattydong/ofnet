@@ -19,21 +19,19 @@ const (
 	MeterExperimenter MeterType = 0xFFFF /* Experimenter meter band. */
 )
 
-type MeterBundleMessage struct {
-	message *openflow15.MeterMod
-}
+type MeterBundleMessage openflow15.MeterMod
 
 func (m *MeterBundleMessage) resetXid(xid uint32) util.Message {
-	m.message.Xid = xid
-	return m.message
+	m.Xid = xid
+	return m
 }
 
 func (m *MeterBundleMessage) getXid() uint32 {
-	return m.message.Xid
+	return m.Xid
 }
 
 func (m *MeterBundleMessage) GetMessage() util.Message {
-	return m.message
+	return m
 }
 
 type Meter struct {
@@ -91,7 +89,8 @@ func (self *Meter) getMeterModMessage(command int) *openflow15.MeterMod {
 
 func (self *Meter) GetBundleMessage(command int) *MeterBundleMessage {
 	meterMod := self.getMeterModMessage(command)
-	return &MeterBundleMessage{meterMod}
+	msg := MeterBundleMessage(*meterMod)
+	return &msg
 }
 
 func (self *Meter) Delete() error {
