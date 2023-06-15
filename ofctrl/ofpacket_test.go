@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -354,4 +355,44 @@ func generatePacketOut(srcMAC net.HardwareAddr, dstMAC net.HardwareAddr, srcIP n
 		pktOut.Actions = actions
 	}
 	return pktOut
+}
+
+func Test_PacketIn2UnMarshal(t *testing.T) {
+	msg := []byte{
+		0, 0, 0, 146, 18, 140, 235, 64, 244, 97, 250, 225, 185, 29, 98, 76, 8, 0, 69, 0, 0, 128, 151, 168, 0, 0, 64, 17, 95, 107, 192, 168, 1, 5, 192, 168, 1, 4, 74, 57, 20, 82, 0, 108, 13, 49, 117, 159, 251, 198, 61, 109, 42, 121, 234, 20, 98, 87, 11, 180, 91, 59, 161, 218, 102, 137, 89, 223, 92, 99, 99, 210, 6, 161, 88, 61, 58, 221, 130, 3, 79, 13, 108, 100, 49, 145, 217, 127, 208, 138, 83, 143, 196, 218, 213, 142, 95, 176, 200, 34, 238, 76, 163, 124, 177, 196, 162, 67, 103, 87, 121, 250, 175, 94, 99, 41, 35, 235, 175, 72, 139, 243, 88, 174, 46, 60, 46, 253, 234, 183, 153, 195, 182, 226, 236, 29, 141, 149, 78, 195, 170, 167, 98, 114, 152, 155, 0, 0, 0, 0, 0, 0, 0, 3, 0, 5, 28, 0, 0, 0, 0, 4, 0, 16, 0, 0, 0, 0, 0, 31, 2, 0, 0, 0, 0, 0, 0, 5, 0, 5, 0, 0, 0, 0, 0, 6, 0, 76, 128, 0, 0, 4, 0, 0, 0, 6, 128, 1, 0, 8, 2, 64, 0, 3, 0, 0, 0, 5, 128, 1, 3, 16, 0, 0, 0, 25, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 128, 1, 4, 8, 0, 1, 0, 0, 0, 0, 0, 3, 128, 1, 7, 16, 0, 0, 0, 2, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 6, 1, 1, 0, 0,
+	}
+	msgs := make([][]byte, 10000)
+	for i := range msgs {
+		copy(msgs[i], msg)
+	}
+	wg := sync.WaitGroup{}
+	wg.Add(10000)
+	for i := range msgs {
+		msgBytes := msgs[i]
+		go func() {
+			wg.Done()
+			pktIn2 := new(openflow15.PacketIn2)
+			err := pktIn2.UnmarshalBinary(msgBytes)
+			assert.NoError(t, err)
+			var mfs []openflow15.MatchField
+			for _, prop := range pktIn2.Props {
+				fmt.Printf("%+v\n", prop)
+				metaField, ok := prop.(*openflow15.PacketIn2PropMetadata)
+				if ok {
+					for _, mf := range metaField.Fields {
+						mfs = append(mfs, mf)
+						valueBytes, _ := mf.Value.MarshalBinary()
+						var maskBytes []byte
+						if mf.HasMask {
+							maskBytes, _ = mf.Mask.MarshalBinary()
+						}
+						fmt.Printf("found reg match field class %d, field %d, value %v, mask %v\n", mf.Class, mf.Field, valueBytes, maskBytes)
+					}
+				}
+			}
+			pktIn := parsePacktInFromNXPacketIn2(pktIn2)
+			assert.ElementsMatch(t, pktIn.Match.Fields, mfs)
+		}()
+	}
+	wg.Wait()
 }
